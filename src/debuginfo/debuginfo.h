@@ -27,7 +27,8 @@ namespace dncdbg::DebugInfo
 {
 
 HRESULT ResolveBreakpoint(CORDB_ADDRESS modAddress, const Source &source, int32_t sourceLine, int32_t sourceColumn,
-                          PDB::GlobalFileIndex *pGlobalFileIndex, std::vector<PDB::ResolvedBreakpoint> &resolvedPoints);
+                          PDB::GlobalFileIndex *pGlobalFileIndex, std::vector<PDB::ResolvedBreakpoint> &resolvedPoints,
+                          bool *pExact = nullptr);
 
 using PDBInfoCallback = FunctionRef<HRESULT(const PDBInfo &)>;
 
