@@ -949,7 +949,7 @@ HRESULT GetSequencePointByFrame(ICorDebugFrame *pFrame, PDB::SequencePoint &sequ
 
 HRESULT ResolveBreakpoint(CORDB_ADDRESS modAddress, const Source &source, int32_t sourceLine,
                           int32_t sourceColumn, PDB::GlobalFileIndex *pGlobalFileIndex,
-                          std::vector<PDB::ResolvedBreakpoint> &resolvedPoints)
+                          std::vector<PDB::ResolvedBreakpoint> &resolvedPoints, bool *pExact)
 {
     if (source.sourceReference > 0)
     {
@@ -967,7 +967,7 @@ HRESULT ResolveBreakpoint(CORDB_ADDRESS modAddress, const Source &source, int32_
         return GetPDBInfo(globalFileIndex.modAddress,
             [&](const PDBInfo &pdbInfo) -> HRESULT
             {
-                return DebugSources::ResolveBreakpoints(pdbInfo, globalFileIndex.sourceFileIndex, sourceLine, sourceColumn, resolvedPoints);
+                return DebugSources::ResolveBreakpoints(pdbInfo, globalFileIndex.sourceFileIndex, sourceLine, pExact, sourceColumn, resolvedPoints);
             });
     }
 
@@ -982,7 +982,7 @@ HRESULT ResolveBreakpoint(CORDB_ADDRESS modAddress, const Source &source, int32_
         return E_FAIL;
     }
 
-    return DebugSources::ResolveBreakpoints(*pPDBInfo, resolvedSourceFileIndex, sourceLine, sourceColumn, resolvedPoints);
+    return DebugSources::ResolveBreakpoints(*pPDBInfo, resolvedSourceFileIndex, sourceLine, pExact, sourceColumn, resolvedPoints);
 }
 
 HRESULT GetLocalConstants(ICorDebugModule *pModule, mdMethodDef methodToken, uint32_t ilOffset,

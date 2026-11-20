@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <functional>
 #include <list>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <string_view>
@@ -65,7 +66,8 @@ struct ManagedSourceBreakpoint
     int32_t columnNum{0};
     int32_t endLine{0};
     int32_t endColumn{0};
-    uint32_t hitCount{0};
+    // Shared by all modules the breakpoint is bound in, hit conditions count hits of the breakpoint, not of a module.
+    std::shared_ptr<uint32_t> hitCount;
     HitCondition hitCondition;
     std::string condition;
     std::string logMessage;
@@ -122,17 +124,31 @@ struct ManagedSourceBreakpointMapping
 {
     SourceBreakpoint breakpoint{0, 0};
     uint32_t id{0};
-    PDB::GlobalFileIndex resolvedGlobalFileIndex{};
     int32_t sourceReference{0};
     std::vector<Checksum> checksums;
-    int32_t resolvedLineNum{0}; // if 0 - no resolved breakpoint available in GetSourceResolvedBreakpoints()
-    int32_t resolvedColumnNum{0}; // if 0 - no resolved breakpoint available in GetSourceResolvedBreakpoints()
+    // Same source file could be compiled into several modules, the breakpoint is bound in every module that has code at the line.
+    // Each binding is a ManagedSourceBreakpoint in GetSourceResolvedBreakpoints() with this mapping id.
+    struct Binding
+    {
+        PDB::GlobalFileIndex globalFileIndex;
+        int32_t lineNum{0};
+        int32_t columnNum{0};
+    };
+    std::vector<Binding> bindings;
+    // Bindings are exact (code at the requested line) or all moved to the same line of the method below,
+    // moved bindings are only used while no loaded module has code at the requested line.
+    bool resolvedExact{false};
+    std::shared_ptr<uint32_t> hitCount{std::make_shared<uint32_t>(0)};
+
+    [[nodiscard]] bool IsResolved() const
+    {
+        return !bindings.empty();
+    }
 
     void Reset()
     {
-        resolvedGlobalFileIndex = PDB::GlobalFileIndex{};
-        resolvedLineNum = 0;
-        resolvedColumnNum = 0;
+        bindings.clear();
+        resolvedExact = false;
     }
 
     ManagedSourceBreakpointMapping() = default;
@@ -164,34 +180,6 @@ std::unordered_map<std::string, std::list<ManagedSourceBreakpointMapping>> &GetS
 {
     static std::unordered_map<std::string, std::list<ManagedSourceBreakpointMapping>> sourceBreakpointMapping;
     return sourceBreakpointMapping;
-}
-
-// [in] pModule - optional, provide filter by module during resolve
-// [in,out] bp - breakpoint data for resolve
-HRESULT ResolveSourceBreakpoint(ICorDebugModule *pModule, const ManagedSourceBreakpoint &bp,
-                                const Source &source, std::vector<PDB::ResolvedBreakpoint> &resolvedPoints,
-                                PDB::GlobalFileIndex &globalFileIndex)
-{
-    if (source.path.empty() || bp.lineNum <= 0 || bp.endLine <= 0)
-    {
-        return E_INVALIDARG;
-    }
-
-    HRESULT Status = S_OK;
-    CORDB_ADDRESS modAddress = 0;
-
-    if (pModule != nullptr)
-    {
-        IfFailRet(pModule->GetBaseAddress(&modAddress));
-    }
-
-    IfFailRet(DebugInfo::ResolveBreakpoint(modAddress, source, bp.lineNum, bp.columnNum, &globalFileIndex, resolvedPoints));
-    if (resolvedPoints.empty())
-    {
-        return E_FAIL;
-    }
-
-    return S_OK;
 }
 
 HRESULT ActivateSourceBreakpoint(ManagedSourceBreakpoint &bp, const std::string &sourcePath,
@@ -245,6 +233,194 @@ HRESULT ActivateSourceBreakpoint(ManagedSourceBreakpoint &bp, const std::string 
     bp.endColumn = resolvedPoints.at(0).endColumn;
 
     return S_OK;
+}
+
+ManagedSourceBreakpoint *FindBound(uint32_t id, const ManagedSourceBreakpointMapping::Binding &binding)
+{
+    const auto bMap_it = GetSourceResolvedBreakpoints().find(binding.globalFileIndex);
+    if (bMap_it == GetSourceResolvedBreakpoints().end())
+    {
+        return nullptr;
+    }
+
+    const auto bList_it = bMap_it->second.find({binding.lineNum, binding.columnNum});
+    if (bList_it == bMap_it->second.end())
+    {
+        return nullptr;
+    }
+
+    for (auto &bp : bList_it->second)
+    {
+        if (bp.id == id)
+        {
+            return &bp;
+        }
+    }
+
+    return nullptr;
+}
+
+void RemoveBound(uint32_t id, const ManagedSourceBreakpointMapping::Binding &binding)
+{
+    const auto bMap_it = GetSourceResolvedBreakpoints().find(binding.globalFileIndex);
+    if (bMap_it == GetSourceResolvedBreakpoints().end())
+    {
+        return;
+    }
+
+    const auto bList_it = bMap_it->second.find({binding.lineNum, binding.columnNum});
+    if (bList_it == bMap_it->second.end())
+    {
+        return;
+    }
+
+    bList_it->second.remove_if([id](const ManagedSourceBreakpoint &bp) { return bp.id == id; });
+
+    if (bList_it->second.empty())
+    {
+        bMap_it->second.erase(bList_it);
+    }
+
+    if (bMap_it->second.empty())
+    {
+        GetSourceResolvedBreakpoints().erase(bMap_it);
+    }
+}
+
+void UnbindAll(ManagedSourceBreakpointMapping &initialBreakpoint)
+{
+    for (const auto &binding : initialBreakpoint.bindings)
+    {
+        RemoveBound(initialBreakpoint.id, binding);
+    }
+
+    initialBreakpoint.Reset();
+}
+
+template <typename Callback>
+void ForEachBound(const ManagedSourceBreakpointMapping &initialBreakpoint, Callback &&cb)
+{
+    for (const auto &binding : initialBreakpoint.bindings)
+    {
+        if (ManagedSourceBreakpoint *pBound = FindBound(initialBreakpoint.id, binding))
+        {
+            cb(*pBound);
+        }
+    }
+}
+
+ManagedSourceBreakpoint CreateManagedBreakpoint(const ManagedSourceBreakpointMapping &initialBreakpoint)
+{
+    ManagedSourceBreakpoint bp;
+    bp.id = initialBreakpoint.id;
+    bp.lineNum = initialBreakpoint.breakpoint.line;
+    bp.columnNum = initialBreakpoint.breakpoint.column;
+    bp.endLine = initialBreakpoint.breakpoint.line;
+    bp.endColumn = initialBreakpoint.breakpoint.column;
+    bp.condition = initialBreakpoint.breakpoint.condition;
+    bp.hitCondition = initialBreakpoint.breakpoint.hitCondition;
+    bp.logMessage = initialBreakpoint.breakpoint.logMessage;
+    bp.hitCount = initialBreakpoint.hitCount;
+    return bp;
+}
+
+// Binds the breakpoint in one module, the same way the MSVS debugger does:
+// - the breakpoint is bound in every module that has code at the requested line;
+// - only if no module has code at the line, it is moved to the method below (all moved bindings use the same line);
+// - a module loaded later with code at the line replaces moved bindings.
+// Returns S_OK if a new binding was added, S_FALSE otherwise.
+HRESULT BindInModule(ManagedSourceBreakpointMapping &initialBreakpoint, const std::string &pathToSource, CORDB_ADDRESS modAddress)
+{
+    ManagedSourceBreakpoint bp = CreateManagedBreakpoint(initialBreakpoint);
+    Source source(pathToSource, initialBreakpoint.sourceReference);
+    source.checksums = initialBreakpoint.checksums;
+
+    PDB::GlobalFileIndex globalFileIndex;
+    std::vector<PDB::ResolvedBreakpoint> resolvedPoints;
+    bool exact = false;
+    if (pathToSource.empty() || bp.lineNum <= 0 ||
+        FAILED(DebugInfo::ResolveBreakpoint(modAddress, source, bp.lineNum, bp.columnNum, &globalFileIndex, resolvedPoints, &exact)) ||
+        resolvedPoints.empty())
+    {
+        return S_FALSE;
+    }
+
+    for (const auto &binding : initialBreakpoint.bindings)
+    {
+        if (binding.globalFileIndex.modAddress == globalFileIndex.modAddress)
+        {
+            return S_FALSE;
+        }
+    }
+
+    if (initialBreakpoint.IsResolved() && !exact &&
+        (initialBreakpoint.resolvedExact || resolvedPoints.at(0).startLine != initialBreakpoint.bindings.at(0).lineNum))
+    {
+        return S_FALSE;
+    }
+
+    if (FAILED(ActivateSourceBreakpoint(bp, pathToSource, resolvedPoints)))
+    {
+        return S_FALSE;
+    }
+
+    if (exact && !initialBreakpoint.resolvedExact)
+    {
+        UnbindAll(initialBreakpoint);
+    }
+
+    initialBreakpoint.resolvedExact = exact;
+    initialBreakpoint.bindings.push_back({globalFileIndex, bp.lineNum, bp.columnNum});
+    GetSourceResolvedBreakpoints()[globalFileIndex][{bp.lineNum, bp.columnNum}].push_back(std::move(bp));
+    return S_OK;
+}
+
+HRESULT BindInAllModules(ManagedSourceBreakpointMapping &initialBreakpoint, const std::string &pathToSource)
+{
+    std::vector<CORDB_ADDRESS> modAddresses;
+    DebugInfo::GetEachPDBInfo(
+        [&](const PDBInfo &pdbInfo) -> HRESULT
+        {
+            CORDB_ADDRESS modAddress = 0;
+            if (pdbInfo.m_trModule != nullptr && SUCCEEDED(pdbInfo.m_trModule->GetBaseAddress(&modAddress)))
+            {
+                modAddresses.push_back(modAddress);
+            }
+            return S_OK;
+        });
+
+    HRESULT result = S_FALSE;
+    for (const CORDB_ADDRESS modAddress : modAddresses)
+    {
+        if (BindInModule(initialBreakpoint, pathToSource, modAddress) == S_OK)
+        {
+            result = S_OK;
+        }
+    }
+
+    return result;
+}
+
+void ToBreakpoint(const ManagedSourceBreakpointMapping &initialBreakpoint, const std::string &pathToSource, Breakpoint &breakpoint)
+{
+    if (initialBreakpoint.IsResolved())
+    {
+        const auto &binding = initialBreakpoint.bindings.at(0);
+        if (const ManagedSourceBreakpoint *pBound = FindBound(initialBreakpoint.id, binding))
+        {
+            std::string resolvedPath;
+            std::string algorithm;
+            std::string checksum;
+            DebugInfo::GetSourceFile(binding.globalFileIndex, resolvedPath, algorithm, checksum);
+            int32_t sourceReference = 0;
+            SourceReference::GetSourceReference(binding.globalFileIndex, sourceReference, resolvedPath);
+            pBound->ToBreakpoint(breakpoint, resolvedPath, sourceReference, &algorithm, &checksum);
+            return;
+        }
+    }
+
+    const ManagedSourceBreakpoint bp = CreateManagedBreakpoint(initialBreakpoint);
+    bp.ToBreakpoint(breakpoint, pathToSource, initialBreakpoint.sourceReference);
 }
 
 // Special tokens supported in the expression parts of a logpoint message (see ExpandLogMessageTokens()).
@@ -416,7 +592,7 @@ void ExpandLogMessageTokens(const ManagedSourceBreakpoint &b, ICorDebugThread *p
         {addressToken, ToVerbatimStringLiteral(MetadataHelpers::AddrToString(nativeAddress))},
         {tidToken, "$tid"},
         {pidToken, "$pid"},
-        {hitCountToken, IntegerToString(b.hitCount)},
+        {hitCountToken, IntegerToString(*b.hitCount)},
     };
 
     // Resolving the method, caller and thread names is relatively expensive, so resolve them only when
@@ -548,9 +724,9 @@ HRESULT CheckBreakpointHit(ICorDebugThread *pThread, ICorDebugBreakpoint *pBreak
                 }
             }
 
-            ++b.hitCount;
+            ++*b.hitCount;
 
-            if (!BreakpointHelpers::IsEnableByHitCondition(b.hitCount, b.hitCondition))
+            if (!BreakpointHelpers::IsEnableByHitCondition(*b.hitCount, b.hitCondition))
             {
                 continue;
             }
@@ -599,52 +775,22 @@ HRESULT ManagedCallbackLoadModule(ICorDebugModule *pModule)
 {
     const std::scoped_lock<std::mutex> lock(GetBreakpointsMutex());
 
+    HRESULT Status = S_OK;
+    CORDB_ADDRESS modAddress = 0;
+    IfFailRet(pModule->GetBaseAddress(&modAddress));
+
     for (auto &[initialPathToSource, initialBreakpoints] : GetSourceBreakpointMapping())
     {
         for (auto &initialBreakpoint : initialBreakpoints)
         {
-            if (initialBreakpoint.resolvedLineNum != 0)
+            if (BindInModule(initialBreakpoint, initialPathToSource, modAddress) != S_OK)
             {
                 continue;
             }
-
-            ManagedSourceBreakpoint bp;
-            bp.id = initialBreakpoint.id;
-            bp.lineNum = initialBreakpoint.breakpoint.line;
-            bp.columnNum = initialBreakpoint.breakpoint.column;
-            bp.endLine = initialBreakpoint.breakpoint.line;
-            bp.endColumn = initialBreakpoint.breakpoint.column;
-            bp.condition = initialBreakpoint.breakpoint.condition;
-            bp.hitCondition = initialBreakpoint.breakpoint.hitCondition;
-            bp.logMessage = initialBreakpoint.breakpoint.logMessage;
-            PDB::GlobalFileIndex resolvedGlobalFileIndex;
-            std::vector<PDB::ResolvedBreakpoint> resolvedPoints;
-            Source source(initialPathToSource, initialBreakpoint.sourceReference);
-            source.checksums = initialBreakpoint.checksums;
-
-            if (FAILED(ResolveSourceBreakpoint(pModule, bp, source,
-                                               resolvedPoints, resolvedGlobalFileIndex)) ||
-                FAILED(ActivateSourceBreakpoint(bp, initialPathToSource, resolvedPoints)))
-            {
-                continue;
-            }
-
-            std::string resolvedPath;
-            std::string algorithm;
-            std::string checksum;
-            DebugInfo::GetSourceFile(resolvedGlobalFileIndex, resolvedPath, algorithm, checksum);
-            int32_t sourceReference = 0;
-            SourceReference::GetSourceReference(resolvedGlobalFileIndex, sourceReference, resolvedPath);
 
             Breakpoint breakpoint;
-            bp.ToBreakpoint(breakpoint, resolvedPath, sourceReference, &algorithm, &checksum);
+            ToBreakpoint(initialBreakpoint, initialPathToSource, breakpoint);
             DAP::EmitBreakpointEvent({BreakpointEventReason::Changed, breakpoint});
-
-            initialBreakpoint.resolvedGlobalFileIndex = resolvedGlobalFileIndex;
-            initialBreakpoint.resolvedLineNum = bp.lineNum;
-            initialBreakpoint.resolvedColumnNum = bp.columnNum;
-
-            GetSourceResolvedBreakpoints()[resolvedGlobalFileIndex][{initialBreakpoint.resolvedLineNum, initialBreakpoint.resolvedColumnNum}].push_back(std::move(bp));
         }
     }
 
@@ -659,72 +805,43 @@ HRESULT ManagedCallbackUnloadModule(ICorDebugModule *pModule)
     CORDB_ADDRESS modAddress = 0;
     IfFailRet(pModule->GetBaseAddress(&modAddress));
 
-    std::unordered_set<uint32_t> removedIds;
-
-    for (auto fit = GetSourceResolvedBreakpoints().begin(); fit != GetSourceResolvedBreakpoints().end();)
+    for (auto &[initialPathToSource, initialBreakpoints] : GetSourceBreakpointMapping())
     {
-        std::unordered_map<std::pair<int32_t, int32_t>, std::list<ManagedSourceBreakpoint>, LineColumnHash> &fileResolvedBreakpoints = fit->second;
-
-        for (auto lit = fileResolvedBreakpoints.begin(); lit != fileResolvedBreakpoints.end();)
+        for (auto &initialBreakpoint : initialBreakpoints)
         {
-            std::list<ManagedSourceBreakpoint> &lineResolvedBreakpoints = lit->second;
+            auto &bindings = initialBreakpoint.bindings;
+            const auto removed = std::remove_if(bindings.begin(), bindings.end(),
+                [&](const ManagedSourceBreakpointMapping::Binding &binding)
+                {
+                    if (binding.globalFileIndex.modAddress != modAddress)
+                    {
+                        return false;
+                    }
 
-            for (auto it = lineResolvedBreakpoints.begin(); it != lineResolvedBreakpoints.end();)
+                    RemoveBound(initialBreakpoint.id, binding);
+                    return true;
+                });
+            if (removed == bindings.end())
             {
-                ManagedSourceBreakpoint &managedSourceBreakpoint = *it;
-
-                assert(!managedSourceBreakpoint.trFuncBreakpoints.empty());
-
-                CORDB_ADDRESS brModAddress = 0;
-                // Check only the first element, see ActivateSourceBreakpoint() code:
-                // the debugger doesn't support breakpoints with the same source name in different modules.
-                if (FAILED(BreakpointHelpers::GetFunctionBreakpointModAddress(managedSourceBreakpoint.trFuncBreakpoints.at(0).first, brModAddress)) ||
-                    modAddress != brModAddress)
-                {
-                    ++it;
-                }
-                else
-                {
-                    removedIds.emplace(managedSourceBreakpoint.id);
-                    it = lineResolvedBreakpoints.erase(it);
-                }
+                continue;
             }
 
-            if (lineResolvedBreakpoints.empty())
+            bindings.erase(removed, bindings.end());
+
+            Breakpoint breakpoint;
+            if (bindings.empty())
             {
-                lit = fileResolvedBreakpoints.erase(lit);
+                initialBreakpoint.Reset();
+                breakpoint.id = initialBreakpoint.id;
+                breakpoint.verified = false;
+                breakpoint.message = "Breakpoint reset at module unload.";
             }
             else
             {
-                ++lit;
+                ToBreakpoint(initialBreakpoint, initialPathToSource, breakpoint);
             }
-        }
 
-        if (fileResolvedBreakpoints.empty())
-        {
-            fit = GetSourceResolvedBreakpoints().erase(fit);
-        }
-        else
-        {
-            ++fit;
-        }
-    }
-
-    // Reset removed resolved breakpoints.
-    for (auto &sourceBreakpoints : GetSourceBreakpointMapping())
-    {
-        for (auto &bp : sourceBreakpoints.second)
-        {
-            if (removedIds.find(bp.id) != removedIds.cend())
-            {
-                bp.Reset();
-
-                Breakpoint breakpoint;
-                breakpoint.id = bp.id;
-                breakpoint.verified = false;
-                breakpoint.message = "Breakpoint reset at module unload.";
-                DAP::EmitBreakpointEvent({BreakpointEventReason::Changed, breakpoint});
-            }
+            DAP::EmitBreakpointEvent({BreakpointEventReason::Changed, breakpoint});
         }
     }
 
@@ -736,47 +853,6 @@ HRESULT SetSourceBreakpoints(bool haveProcess, const Source &source, const std::
 {
     const std::scoped_lock<std::mutex> lock(GetBreakpointsMutex());
 
-    const auto RemoveResolvedByInitialBreakpoint =
-        [&](ManagedSourceBreakpointMapping &initialBreakpoint)
-        {
-            if (initialBreakpoint.resolvedLineNum == 0) // if 0 - no resolved breakpoint available in GetSourceResolvedBreakpoints()
-            {
-                return S_OK;
-            }
-
-            const auto bMap_it = GetSourceResolvedBreakpoints().find(initialBreakpoint.resolvedGlobalFileIndex);
-            if (bMap_it == GetSourceResolvedBreakpoints().cend())
-            {
-                return E_FAIL;
-            }
-
-            const auto bList_it = bMap_it->second.find({initialBreakpoint.resolvedLineNum, initialBreakpoint.resolvedColumnNum});
-            if (bList_it == bMap_it->second.cend())
-            {
-                return E_FAIL;
-            }
-
-            for (auto itList = bList_it->second.begin(); itList != bList_it->second.end();)
-            {
-                if ((*itList).id == initialBreakpoint.id)
-                {
-                    itList = bList_it->second.erase(itList);
-                    break;
-                }
-                else
-                {
-                    ++itList;
-                }
-            }
-
-            if (bList_it->second.empty())
-            {
-                bMap_it->second.erase(bList_it);
-            }
-
-            return S_OK;
-        };
-
     HRESULT Status = S_OK;
     if (sourceBreakpoints.empty())
     {
@@ -787,11 +863,11 @@ HRESULT SetSourceBreakpoints(bool haveProcess, const Source &source, const std::
             {
                 Breakpoint breakpoint;
                 breakpoint.id = initialBreakpoint.id;
-                breakpoint.verified = initialBreakpoint.resolvedLineNum != 0;
+                breakpoint.verified = initialBreakpoint.IsResolved();
                 const BreakpointEvent event(BreakpointEventReason::Removed, breakpoint);
                 DAP::EmitBreakpointEvent(event);
 
-                IfFailRet(RemoveResolvedByInitialBreakpoint(initialBreakpoint));
+                UnbindAll(initialBreakpoint);
             }
             GetSourceBreakpointMapping().erase(it);
         }
@@ -818,11 +894,11 @@ HRESULT SetSourceBreakpoints(bool haveProcess, const Source &source, const std::
         {
             Breakpoint breakpoint;
             breakpoint.id = initialBreakpoint.id;
-            breakpoint.verified = initialBreakpoint.resolvedLineNum != 0;
+            breakpoint.verified = initialBreakpoint.IsResolved();
             const BreakpointEvent event(BreakpointEventReason::Removed, breakpoint);
             DAP::EmitBreakpointEvent(event);
 
-            IfFailRet(RemoveResolvedByInitialBreakpoint(initialBreakpoint));
+            UnbindAll(initialBreakpoint);
             it = breakpointsInSource.erase(it);
         }
         else
@@ -835,63 +911,35 @@ HRESULT SetSourceBreakpoints(bool haveProcess, const Source &source, const std::
 
     // Note, DAP requires that "sourceBreakpoints" and "functionBreakpoints" must have the same indexes for the same breakpoints.
 
+    const auto setUnresolvedMessage = [haveProcess](Breakpoint &breakpoint)
+        {
+            breakpoint.message = haveProcess ? "The breakpoint will not currently be hit. No symbols have been loaded for this document."
+                                             : "The breakpoint is pending and will be resolved when debugging starts.";
+        };
+
     for (const auto &sb : sourceBreakpoints)
     {
-        const int32_t line = sb.line;
-        const int32_t column = sb.column;
         Breakpoint breakpoint;
 
-        const auto b = breakpointsInSourceMap.find({line, column});
+        const auto b = breakpointsInSourceMap.find({sb.line, sb.column});
         if (b == breakpointsInSourceMap.cend())
         {
+            // New breakpoint
             ManagedSourceBreakpointMapping initialBreakpoint;
             initialBreakpoint.breakpoint = sb;
             initialBreakpoint.id = getId();
             initialBreakpoint.sourceReference = source.sourceReference;
             initialBreakpoint.checksums = source.checksums;
 
-            // New breakpoint
-            ManagedSourceBreakpoint bp;
-            bp.id = initialBreakpoint.id;
-            bp.lineNum = line;
-            bp.columnNum = column;
-            bp.endLine = line;
-            bp.endColumn = column;
-            bp.condition = initialBreakpoint.breakpoint.condition;
-            bp.hitCondition = initialBreakpoint.breakpoint.hitCondition;
-            bp.logMessage = initialBreakpoint.breakpoint.logMessage;
-            PDB::GlobalFileIndex resolvedGlobalFileIndex;
-            std::vector<PDB::ResolvedBreakpoint> resolvedPoints;
-
-            if (haveProcess &&
-                SUCCEEDED(ResolveSourceBreakpoint(nullptr, bp, source, resolvedPoints, resolvedGlobalFileIndex)) &&
-                SUCCEEDED(ActivateSourceBreakpoint(bp, source.path, resolvedPoints)))
+            if (haveProcess)
             {
-                initialBreakpoint.resolvedGlobalFileIndex = resolvedGlobalFileIndex;
-                initialBreakpoint.resolvedLineNum = bp.lineNum;
-                initialBreakpoint.resolvedColumnNum = bp.columnNum;
-
-                std::string resolvedPath;
-                std::string algorithm;
-                std::string checksum;
-                DebugInfo::GetSourceFile(resolvedGlobalFileIndex, resolvedPath, algorithm, checksum);
-                int32_t sourceReference = 0;
-                SourceReference::GetSourceReference(resolvedGlobalFileIndex, sourceReference, resolvedPath);
-
-                bp.ToBreakpoint(breakpoint, resolvedPath, sourceReference, &algorithm, &checksum);
-                GetSourceResolvedBreakpoints()[resolvedGlobalFileIndex][{initialBreakpoint.resolvedLineNum, initialBreakpoint.resolvedColumnNum}].push_back(std::move(bp));
+                BindInAllModules(initialBreakpoint, source.path);
             }
-            else
+
+            ToBreakpoint(initialBreakpoint, source.path, breakpoint);
+            if (!initialBreakpoint.IsResolved())
             {
-                bp.ToBreakpoint(breakpoint, source.path, source.sourceReference);
-                if (!haveProcess)
-                {
-                    breakpoint.message = "The breakpoint is pending and will be resolved when debugging starts.";
-                }
-                else
-                {
-                    breakpoint.message = "The breakpoint will not currently be hit. No symbols have been loaded for this document.";
-                }
+                setUnresolvedMessage(breakpoint);
             }
 
             breakpointsInSource.push_back(std::move(initialBreakpoint));
@@ -903,100 +951,73 @@ HRESULT SetSourceBreakpoints(bool haveProcess, const Source &source, const std::
             initialBreakpoint.breakpoint.hitCondition = sb.hitCondition;
             initialBreakpoint.breakpoint.logMessage = sb.logMessage;
 
-            if (initialBreakpoint.resolvedLineNum != 0)
+            if (initialBreakpoint.IsResolved())
             {
-                const auto bMap_it = GetSourceResolvedBreakpoints().find(initialBreakpoint.resolvedGlobalFileIndex);
-                if (bMap_it == GetSourceResolvedBreakpoints().cend())
-                {
-                    return E_FAIL;
-                }
-
-                const auto bList_it = bMap_it->second.find({initialBreakpoint.resolvedLineNum, initialBreakpoint.resolvedColumnNum});
-                if (bList_it == bMap_it->second.cend())
-                {
-                    return E_FAIL;
-                }
-
-                for (auto &bp : bList_it->second)
-                {
-                    if (initialBreakpoint.id != bp.id)
+                // Existing breakpoint
+                bool changedCondition = false;
+                bool changedHitCondition = false;
+                bool changedLogMessage = false;
+                ForEachBound(initialBreakpoint,
+                    [&](ManagedSourceBreakpoint &bp)
                     {
-                        continue;
+                        changedCondition = changedCondition || bp.condition != initialBreakpoint.breakpoint.condition;
+                        changedHitCondition = changedHitCondition || bp.hitCondition != initialBreakpoint.breakpoint.hitCondition;
+                        const bool bpChangedLogMessage = bp.logMessage != initialBreakpoint.breakpoint.logMessage;
+                        changedLogMessage = changedLogMessage || bpChangedLogMessage;
+                        bp.condition = initialBreakpoint.breakpoint.condition;
+                        bp.hitCondition = initialBreakpoint.breakpoint.hitCondition;
+                        bp.logMessage = initialBreakpoint.breakpoint.logMessage;
+                        if (bpChangedLogMessage)
+                        {
+                            bp.logMessageParts.clear();
+                            bp.hasSpecialTokens = false;
+                        }
+                    });
+
+                ToBreakpoint(initialBreakpoint, source.path, breakpoint);
+                if (changedCondition || changedHitCondition || changedLogMessage)
+                {
+                    std::string changed;
+
+                    if (changedCondition)
+                    {
+                        changed = "condition";
                     }
-
-                    // Existing breakpoint
-                    const bool changedCondition = bp.condition != initialBreakpoint.breakpoint.condition;
-                    const bool changedHitCondition = bp.hitCondition != initialBreakpoint.breakpoint.hitCondition;
-                    const bool changedLogMessage = bp.logMessage != initialBreakpoint.breakpoint.logMessage;
-                    bp.condition = initialBreakpoint.breakpoint.condition;
-                    bp.hitCondition = initialBreakpoint.breakpoint.hitCondition;
-                    bp.logMessage = initialBreakpoint.breakpoint.logMessage;
-                    if (changedLogMessage)
+                    if (changedHitCondition)
                     {
-                        bp.logMessageParts.clear();
-                        bp.hasSpecialTokens = false;
-                    }
-                    std::string resolvedPath;
-                    std::string algorithm;
-                    std::string checksum;
-                    DebugInfo::GetSourceFile(initialBreakpoint.resolvedGlobalFileIndex, resolvedPath, algorithm, checksum);
-                    int32_t sourceReference = 0;
-                    SourceReference::GetSourceReference(initialBreakpoint.resolvedGlobalFileIndex, sourceReference, resolvedPath);
-
-                    bp.ToBreakpoint(breakpoint, resolvedPath, sourceReference, &algorithm, &checksum);
-                    if (changedCondition || changedHitCondition || changedLogMessage)
-                    {
-                        std::string changed;
-
                         if (changedCondition)
                         {
-                            changed = "condition";
+                            changed += ", ";
                         }
-                        if (changedHitCondition)
-                        {
-                            if (changedCondition)
-                            {
-                                changed += ", ";
-                            }
-                            changed += "hitCondition";
-                        }
-                        if (changedLogMessage)
-                        {
-                            if (changedCondition || changedHitCondition)
-                            {
-                                changed += ", ";
-                            }
-                            changed += "logMessage";
-                        }
-
-                        breakpoint.message = "Breakpoint " + changed + " changed.";
-                        const BreakpointEvent event(BreakpointEventReason::Changed, breakpoint);
-                        DAP::EmitBreakpointEvent(event);
-                        breakpoint.message.clear();
+                        changed += "hitCondition";
                     }
-                    break;
+                    if (changedLogMessage)
+                    {
+                        if (changedCondition || changedHitCondition)
+                        {
+                            changed += ", ";
+                        }
+                        changed += "logMessage";
+                    }
+
+                    breakpoint.message = "Breakpoint " + changed + " changed.";
+                    const BreakpointEvent event(BreakpointEventReason::Changed, breakpoint);
+                    DAP::EmitBreakpointEvent(event);
+                    breakpoint.message.clear();
                 }
             }
             else
             {
                 // Was already added, but was not yet resolved.
-                ManagedSourceBreakpoint bp;
-                bp.id = initialBreakpoint.id;
-                bp.lineNum = line;
-                bp.columnNum = column;
-                bp.endLine = line;
-                bp.endColumn = column;
-                bp.condition = initialBreakpoint.breakpoint.condition;
-                bp.hitCondition = initialBreakpoint.breakpoint.hitCondition;
-                bp.logMessage = initialBreakpoint.breakpoint.logMessage;
-                bp.ToBreakpoint(breakpoint, source.path, source.sourceReference);
-                if (!haveProcess)
+                if (haveProcess)
                 {
-                    breakpoint.message = "The breakpoint is pending and will be resolved when debugging starts.";
+                    BindInAllModules(initialBreakpoint, source.path);
                 }
-                else
+
+                ToBreakpoint(initialBreakpoint, source.path, breakpoint);
+                if (!initialBreakpoint.IsResolved())
                 {
-                    breakpoint.message = "The breakpoint will not currently be hit. No symbols have been loaded for this document.";
+                    setUnresolvedMessage(breakpoint);
                 }
             }
         }
@@ -1048,6 +1069,7 @@ void Cleanup()
         for (auto &bp : sourceBreakpoints.second)
         {
             bp.Reset();
+            *bp.hitCount = 0;
         }
     }
 }

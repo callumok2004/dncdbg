@@ -353,7 +353,7 @@ HRESULT FillMethodRanges(ICorDebugModule *pModule, mdhandle_t pdbHandle, PDB::So
     return S_OK;
 }
 
-HRESULT ResolveBreakpoints(const PDBInfo &pdbInfo, uint32_t sourceFileIndex, int32_t sourceLine,
+HRESULT ResolveBreakpoints(const PDBInfo &pdbInfo, uint32_t sourceFileIndex, int32_t sourceLine, bool *pExact,
                            int32_t sourceColumn, std::vector<PDB::ResolvedBreakpoint> &resolvedPoints)
 {
     std::vector<mdMethodDef> methodTokens;
@@ -367,6 +367,12 @@ HRESULT ResolveBreakpoints(const PDBInfo &pdbInfo, uint32_t sourceFileIndex, int
                                         correctedStartColumn, methodTokens, closestNestedToken))
     {
         return E_FAIL;
+    }
+    // Exact - the line belongs to a method in this module (could still be adjusted to the closest sequence point inside the method),
+    // otherwise the breakpoint was moved to the method below.
+    if (pExact != nullptr)
+    {
+        *pExact = correctedStartLine == sourceLine;
     }
     if (methodTokens.size() > static_cast<size_t>(std::numeric_limits<int32_t>::max()))
     {
