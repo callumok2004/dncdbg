@@ -135,9 +135,6 @@ struct ManagedSourceBreakpointMapping
         int32_t columnNum{0};
     };
     std::vector<Binding> bindings;
-    // Bindings are exact (code at the requested line) or all moved to the same line of the method below,
-    // moved bindings are only used while no loaded module has code at the requested line.
-    bool resolvedExact{false};
     std::shared_ptr<uint32_t> hitCount{std::make_shared<uint32_t>(0)};
 
     [[nodiscard]] bool IsResolved() const
@@ -148,7 +145,6 @@ struct ManagedSourceBreakpointMapping
     void Reset()
     {
         bindings.clear();
-        resolvedExact = false;
     }
 
     ManagedSourceBreakpointMapping() = default;
@@ -324,10 +320,9 @@ ManagedSourceBreakpoint CreateManagedBreakpoint(const ManagedSourceBreakpointMap
     return bp;
 }
 
-// Binds the breakpoint in one module, the same way the MSVS debugger does:
-// - the breakpoint is bound in every module that has code at the requested line;
-// - only if no module has code at the line, it is moved to the method below (all moved bindings use the same line);
-// - a module loaded later with code at the line replaces moved bindings.
+// Binds the breakpoint in one module, the same way the MSVS debugger does: the breakpoint is bound in every module
+// that has code at the requested line (inside a method it is still adjusted to the closest sequence point),
+// modules without code at the line get no binding. Moving the location outside of methods is up to the IDE.
 // Returns S_OK if a new binding was added, S_FALSE otherwise.
 HRESULT BindInModule(ManagedSourceBreakpointMapping &initialBreakpoint, const std::string &pathToSource, CORDB_ADDRESS modAddress)
 {
@@ -353,23 +348,11 @@ HRESULT BindInModule(ManagedSourceBreakpointMapping &initialBreakpoint, const st
         }
     }
 
-    if (initialBreakpoint.IsResolved() && !exact &&
-        (initialBreakpoint.resolvedExact || resolvedPoints.at(0).startLine != initialBreakpoint.bindings.at(0).lineNum))
+    if (!exact || FAILED(ActivateSourceBreakpoint(bp, pathToSource, resolvedPoints)))
     {
         return S_FALSE;
     }
 
-    if (FAILED(ActivateSourceBreakpoint(bp, pathToSource, resolvedPoints)))
-    {
-        return S_FALSE;
-    }
-
-    if (exact && !initialBreakpoint.resolvedExact)
-    {
-        UnbindAll(initialBreakpoint);
-    }
-
-    initialBreakpoint.resolvedExact = exact;
     initialBreakpoint.bindings.push_back({globalFileIndex, bp.lineNum, bp.columnNum});
     GetSourceResolvedBreakpoints()[globalFileIndex][{bp.lineNum, bp.columnNum}].push_back(std::move(bp));
     return S_OK;
