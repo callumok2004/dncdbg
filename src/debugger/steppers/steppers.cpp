@@ -36,6 +36,43 @@ PDB::SequencePoint &GetStepStartSP()
     return stepStartSP;
 }
 
+HRESULT FindFirstFrameWithSource(ICorDebugThread *pThread, ICorDebugFrame **ppFrame)
+{
+    HRESULT Status = S_OK;
+    ToRelease<ICorDebugChainEnum> trChains;
+    IfFailRet(pThread->EnumerateChains(&trChains));
+
+    ICorDebugChain *pChain = nullptr;
+    ULONG chainsFetched = 0;
+    while (SUCCEEDED(trChains->Next(1, &pChain, &chainsFetched)) && chainsFetched == 1)
+    {
+        const ToRelease<ICorDebugChain> trChain(pChain);
+        ToRelease<ICorDebugFrameEnum> trFrames;
+        if (FAILED(trChain->EnumerateFrames(&trFrames)))
+        {
+            continue;
+        }
+
+        ICorDebugFrame *pFrame = nullptr;
+        ULONG framesFetched = 0;
+        while (SUCCEEDED(trFrames->Next(1, &pFrame, &framesFetched)) && framesFetched == 1)
+        {
+            ToRelease<ICorDebugFrame> trFrame(pFrame);
+            ToRelease<ICorDebugILFrame> trILFrame;
+            if (FAILED(trFrame->QueryInterface(IID_ICorDebugILFrame, reinterpret_cast<void **>(&trILFrame))) ||
+                FAILED(DebugInfo::GetSequencePointByFrame(trFrame, GetStepStartSP())))
+            {
+                continue;
+            }
+
+            *ppFrame = trFrame.Detach();
+            return S_OK;
+        }
+    }
+
+    return E_FAIL;
+}
+
 // Previous step-in was made in a method that must not be stepped. We need to store this information in order to step in again as soon as we leave this method.
 // Usually this is code related to step filtering, but in some cases we could also filter compiler-generated code and code covered by the StepThrough attribute.
 bool &GetFilteredPrevStep()
@@ -78,17 +115,19 @@ HRESULT SetupStep(ICorDebugThread *pThread, StepType stepType)
 
     ToRelease<ICorDebugFrame> trFrame;
     IfFailRet(pThread->GetActiveFrame(&trFrame));
-    if (trFrame == nullptr)
+
+    // The active frame could be native or have no source (for example, a P/Invoke blocked in GetMessage),
+    // in this case step relative to the first managed frame with source.
+    ToRelease<ICorDebugFrame> trUserFrame;
+    if (trFrame == nullptr || FAILED(DebugInfo::GetSequencePointByFrame(trFrame, GetStepStartSP())))
     {
-        return E_FAIL;
+        IfFailRet(FindFirstFrameWithSource(pThread, &trUserFrame));
     }
 
-    IfFailRet(DebugInfo::GetSequencePointByFrame(trFrame, GetStepStartSP()));
-
-    IfFailRet(AsyncStepper::SetupStep(pThread, stepType));
+    IfFailRet(AsyncStepper::SetupStep(pThread, stepType, trUserFrame.GetPtr()));
     if (Status == S_USE_SIMPLE_STEPPER)
     {
-        return SimpleStepper::SetupStep(pThread, stepType);
+        return SimpleStepper::SetupStep(pThread, stepType, trUserFrame.GetPtr());
     }
 
     return S_OK;

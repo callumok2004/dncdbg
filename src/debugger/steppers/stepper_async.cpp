@@ -388,12 +388,20 @@ HRESULT CreateBreakpointIntoNotifyDebuggerOfWaitCompletion(ICorDebugThread *pThr
 
 } // unnamed namespace
 
-HRESULT SetupStep(ICorDebugThread *pThread, StepType stepType)
+HRESULT SetupStep(ICorDebugThread *pThread, StepType stepType, ICorDebugFrame *pFrame)
 {
     HRESULT Status = S_OK;
 
     ToRelease<ICorDebugFrame> trFrame;
-    IfFailRet(pThread->GetActiveFrame(&trFrame));
+    if (pFrame != nullptr)
+    {
+        pFrame->AddRef();
+        trFrame = pFrame;
+    }
+    else
+    {
+        IfFailRet(pThread->GetActiveFrame(&trFrame));
+    }
     if (trFrame == nullptr)
     {
         return E_FAIL;
@@ -448,7 +456,7 @@ HRESULT SetupStep(ICorDebugThread *pThread, StepType stepType)
         IfFailRet(MetadataHelpers::GetFQMDTypeNameByICorValue(trBuilderValue, metadataTypeName));
         if (metadataTypeName == "System.Runtime.CompilerServices.AsyncVoidMethodBuilder")
         {
-            return SimpleStepper::SetupStep(pThread, StepType::STEP_OUT);
+            return SimpleStepper::SetupStep(pThread, StepType::STEP_OUT, pFrame);
         }
 
         IfFailRet(SetNotificationForWaitCompletion(pThread, trBuilderValue));

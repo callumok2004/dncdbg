@@ -35,6 +35,7 @@ HRESULT GetPDBInfo(CORDB_ADDRESS modAddress, PDBInfoCallback cb);
 HRESULT GetEachPDBInfo(PDBInfoCallback cb);
 
 HRESULT GetStepRangeFromCurrentIP(ICorDebugThread *pThread, COR_DEBUG_STEP_RANGE &range);
+HRESULT GetStepRangeFromFrame(ICorDebugFrame *pFrame, COR_DEBUG_STEP_RANGE &range);
 
 void TryLoadModuleSymbols(ICorDebugModule *pModule, Module &module);
 void UnloadModuleSymbols(ICorDebugModule *pModule);
