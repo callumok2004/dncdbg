@@ -1276,13 +1276,13 @@ HRESULT GetStackTrace(ThreadId threadId, FrameLevel startFrame, unsigned maxFram
     return GetStackFrames(trThread, threadId, startFrame, maxFrames, stackFrames);
 }
 
-HRESULT GetVariables(uint32_t variablesReference, std::vector<Variable> &variables)
+HRESULT GetVariables(uint32_t variablesReference, std::vector<Variable> &variables, FormatSpecifier format)
 {
     const ReadLock r_lock(GetDebugProcessRWLock());
     HRESULT Status = S_OK;
     IfFailRet(CheckDebugProcess());
 
-    return Variables::GetVariables(GetTrProcess(), variablesReference, variables);
+    return Variables::GetVariables(GetTrProcess(), variablesReference, variables, format);
 }
 
 HRESULT GetScopes(FrameId frameId, std::vector<Scope> &scopes)
@@ -1294,13 +1294,13 @@ HRESULT GetScopes(FrameId frameId, std::vector<Scope> &scopes)
     return Variables::GetScopes(GetTrProcess(), frameId, scopes);
 }
 
-HRESULT Evaluate(FrameId frameId, const std::string &expression, Variable &variable, std::string &output)
+HRESULT Evaluate(FrameId frameId, const std::string &expression, Variable &variable, std::string &output, FormatSpecifier format)
 {
     const ReadLock r_lock(GetDebugProcessRWLock());
     HRESULT Status = S_OK;
     IfFailRet(CheckDebugProcess());
 
-    return Variables::Evaluate(GetTrProcess(), frameId, expression, variable, output);
+    return Variables::Evaluate(GetTrProcess(), frameId, expression, variable, output, format);
 }
 
 void CancelEvalRunning()

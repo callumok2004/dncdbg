@@ -893,6 +893,20 @@ FrameId GetFrameIdFromArguments(const json &arguments)
                : FrameId{static_cast<int>(frameIdIter.value())};
 }
 
+// Extract the optional `format` (ValueFormat) request argument, `hex: true` displays integers in hexadecimal.
+FormatSpecifier GetValueFormat(const json &arguments)
+{
+    const auto formatIter = arguments.find("format");
+    if (formatIter == arguments.cend() || !formatIter->is_object())
+    {
+        return FormatSpecifier::None;
+    }
+
+    const auto hexIter = formatIter->find("hex");
+    return hexIter != formatIter->cend() && hexIter->is_boolean() && hexIter->get<bool>() ? FormatSpecifier::HexadecimalInteger
+                                                                                         : FormatSpecifier::None;
+}
+
 // Read an optional line/column request field. For a 0-based client, a provided value shifts
 // by one into the internal 1-based numbering; an omitted field stays zero (the internal
 // "not provided" marker).
@@ -1043,7 +1057,7 @@ constexpr std::array<CommandEntry, 32> gCommands{{
             HRESULT Status = S_OK;
             Variable variable;
             std::string output;
-            if (FAILED(Status = ManagedDebugger::Evaluate(frameId, expression, variable, output)))
+            if (FAILED(Status = ManagedDebugger::Evaluate(frameId, expression, variable, output, GetValueFormat(arguments))))
             {
                 if (output.empty())
                 {
@@ -1639,7 +1653,7 @@ constexpr std::array<CommandEntry, 32> gCommands{{
         {
             HRESULT Status = S_OK;
             std::vector<Variable> variables;
-            IfFailRet(ManagedDebugger::GetVariables(arguments.at("variablesReference"), variables));
+            IfFailRet(ManagedDebugger::GetVariables(arguments.at("variablesReference"), variables, GetValueFormat(arguments)));
 
             responseBody.emplace("variables", std::move(variables));
             return S_OK;

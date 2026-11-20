@@ -465,7 +465,16 @@ HRESULT Continue(ICorDebugProcess *pProcess, ThreadId threadId, bool singleThrea
         }
         // Run the target thread; suspend all others only in the single-thread case.
         const CorDebugThreadState setState = iThreadId == static_cast<int>(tid) ? THREAD_RUN : state;
-        if (FAILED(Status = trThread->SetDebugState(setState)))
+        Status = trThread->SetDebugState(setState);
+        if (Status == CORDBG_E_BAD_THREAD_STATE)
+        {
+            // The thread can't change its debug state (for example, it is terminating after an unhandled exception),
+            // it is neither run nor suspended by us, so continue the remaining threads.
+            LOGI(log << "ICorDebugThread::SetDebugState() skipped, bad thread state, threadId=" << static_cast<int>(tid));
+            trThread.Free();
+            continue;
+        }
+        if (FAILED(Status))
         {
             LOGW(log << "ICorDebugThread::SetDebugState() call failed, threadId=" << static_cast<int>(tid)
                      << ", target threadId=" << iThreadId);

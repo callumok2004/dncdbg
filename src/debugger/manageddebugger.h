@@ -67,8 +67,9 @@ HRESULT GetStackTrace(ThreadId threadId, FrameLevel startFrame, unsigned maxFram
                       std::vector<StackFrame> &stackFrames);
 HRESULT StepCommand(ThreadId threadId, StepType stepType, bool singleThread);
 HRESULT GetScopes(FrameId frameId, std::vector<Scope> &scopes);
-HRESULT GetVariables(uint32_t variablesReference, std::vector<Variable> &variables);
-HRESULT Evaluate(FrameId frameId, const std::string &expression, Variable &variable, std::string &output);
+HRESULT GetVariables(uint32_t variablesReference, std::vector<Variable> &variables, FormatSpecifier format = FormatSpecifier::None);
+HRESULT Evaluate(FrameId frameId, const std::string &expression, Variable &variable, std::string &output,
+                 FormatSpecifier format = FormatSpecifier::None);
 void CancelEvalRunning();
 HRESULT SetVariable(const std::string &name, const std::string &value, uint32_t ref, std::string &output);
 HRESULT SetExpression(FrameId frameId, const std::string &expression, const std::string &value, std::string &output);

@@ -19,7 +19,8 @@ namespace dncdbg::Variables
 
 // The caller must guarantee that pProcess is not null for every function that takes it.
 
-HRESULT GetVariables(ICorDebugProcess *pProcess, uint32_t variablesReference, std::vector<Variable> &variables);
+HRESULT GetVariables(ICorDebugProcess *pProcess, uint32_t variablesReference, std::vector<Variable> &variables,
+                     FormatSpecifier format = FormatSpecifier::None);
 
 HRESULT SetVariable(ICorDebugProcess *pProcess, const std::string &name, const std::string &value, uint32_t ref,
                     std::string &output);
@@ -30,7 +31,7 @@ HRESULT SetExpression(ICorDebugProcess *pProcess, FrameId frameId, const std::st
 HRESULT GetScopes(ICorDebugProcess *pProcess, FrameId frameId, std::vector<Scope> &scopes);
 
 HRESULT Evaluate(ICorDebugProcess *pProcess, FrameId frameId, const std::string &expressionWithFormat,
-                 Variable &variable, std::string &output);
+                 Variable &variable, std::string &output, FormatSpecifier format = FormatSpecifier::None);
 
 // Cleans up the Variables internal state. See CleanupDebugSession() in manageddebugger.cpp.
 void Cleanup();
