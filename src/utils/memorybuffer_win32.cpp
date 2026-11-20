@@ -7,17 +7,62 @@
 #include "utils/memorybuffer.h"
 #include "utils/logger.h"
 #include "utils/utf.h"
+#include <array>
 #include <cstdint>
 #include <limits>
 
 namespace dncdbg
 {
 
+namespace
+{
+
+// A mapped file can't be overwritten, so the file is mapped from a temporary shadow copy: the original stays
+// writable (for example, a rebuild of the debuggee while debugging) and the copy is deleted when it is closed.
+HANDLE OpenShadowCopy(const WSTRING &wFilePath)
+{
+    static volatile LONG counter = 0;
+
+    std::array<WCHAR, MAX_PATH + 1> tempPath{};
+    const DWORD tempLength = GetTempPathW(static_cast<DWORD>(tempPath.size()), tempPath.data());
+    if (tempLength == 0 || tempLength >= tempPath.size())
+    {
+        return INVALID_HANDLE_VALUE;
+    }
+
+    WSTRING shadowPath(tempPath.data(), tempLength);
+    shadowPath += W("dncdbg-");
+    shadowPath += to_utf16(std::to_string(GetCurrentProcessId()));
+    shadowPath += W("-");
+    shadowPath += to_utf16(std::to_string(InterlockedIncrement(&counter)));
+    shadowPath += W(".pdb");
+
+    if (CopyFileW(wFilePath.c_str(), shadowPath.c_str(), FALSE) == FALSE)
+    {
+        return INVALID_HANDLE_VALUE;
+    }
+
+    HANDLE handle = CreateFileW(shadowPath.c_str(), GENERIC_READ | DELETE, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                                FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_RANDOM_ACCESS | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+    if (handle == INVALID_HANDLE_VALUE)
+    {
+        DeleteFileW(shadowPath.c_str());
+    }
+
+    return handle;
+}
+
+} // unnamed namespace
+
 bool MemoryBuffer::Open(const std::string &filePath)
 {
     WSTRING wFilePath = to_utf16(filePath);
-    m_fileHandle = CreateFileW(wFilePath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                               FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS, nullptr);
+    m_fileHandle = OpenShadowCopy(wFilePath);
+    if (m_fileHandle == INVALID_HANDLE_VALUE)
+    {
+        m_fileHandle = CreateFileW(wFilePath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                   FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS, nullptr);
+    }
     if (m_fileHandle == INVALID_HANDLE_VALUE)
     {
         return false;

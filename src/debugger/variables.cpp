@@ -556,7 +556,7 @@ HRESULT GetExceptionVariable(FrameId frameId, ICorDebugThread *pThread, Variable
     return E_FAIL;
 }
 
-HRESULT GetStackVariables(FrameId frameId, ICorDebugThread *pThread, std::vector<Variable> &variables)
+HRESULT GetStackVariables(FrameId frameId, ICorDebugThread *pThread, std::vector<Variable> &variables, FormatSpecifier format)
 {
     Variable var;
     if (SUCCEEDED(GetExceptionVariable(frameId, pThread, var)))
@@ -576,16 +576,16 @@ HRESULT GetStackVariables(FrameId frameId, ICorDebugThread *pThread, std::vector
             // If we fail to parse one variable, don't skip the remaining variables.
             if (FAILED(Status = getValue(&trValue, &fallbackTypeName)) ||
                 FAILED(MetadataHelpers::GetFQDisplayTypeName(trValue, var.type)) ||
-                FAILED(PrintValue(pThread, trValue, FormatSpecifier::None, var.value)) ||
+                FAILED(PrintValue(pThread, trValue, format, var.value)) ||
                 FAILED(GetMemoryReference(trValue, var.memoryReference)) ||
-                FAILED(AddVariableReference(pThread, var, frameId, trValue, ValueKind::Variable, FormatSpecifier::None, 0)))
+                FAILED(AddVariableReference(pThread, var, frameId, trValue, ValueKind::Variable, format, 0)))
             {
                 if (Status == CORDBG_E_IL_VAR_NOT_AVAILABLE)
                 {
                     var.type = fallbackTypeName.empty() ? "unknown" : fallbackTypeName;
                     var.value = "Cannot obtain value of the local variable or argument because it is not available at this instruction pointer, possibly because it has been optimized away.";
 
-                    if (FAILED(AddVariableReference(pThread, var, frameId, trValue, ValueKind::Variable, FormatSpecifier::None, 0)))
+                    if (FAILED(AddVariableReference(pThread, var, frameId, trValue, ValueKind::Variable, format, 0)))
                     {
                         return S_OK; // Return success to continue walking.
                     }
@@ -606,8 +606,9 @@ HRESULT GetStackVariables(FrameId frameId, ICorDebugThread *pThread, std::vector
         });
 }
 
-HRESULT GetChildren(const VariableReference &ref, ICorDebugThread *pThread, std::vector<Variable> &variables)
+HRESULT GetChildren(const VariableReference &ref, ICorDebugThread *pThread, std::vector<Variable> &variables, FormatSpecifier format)
 {
+    const FormatSpecifier specifier = ref.specifier | format;
     if (ref.IsScope())
     {
         return E_INVALIDARG;
@@ -647,13 +648,13 @@ HRESULT GetChildren(const VariableReference &ref, ICorDebugThread *pThread, std:
             {
                 // Note, ICorDebugHandleValue derives from ICorDebugValue, so it can be stored in VariableReference.
                 VariableReference variableReference(var, ref.frameId, trHandleValue.Detach(), ref.valueKind,
-                                                    ref.specifier, it.skipToChildIndex);
+                                                    specifier, it.skipToChildIndex);
                 references.emplace(var.variablesReference, std::move(variableReference));
             }
             else
             {
                 // Fallback for value types, null references or in case pinning failed - store raw it.trValue.
-                VariableReference variableReference(var, ref.frameId, it.trValue.Detach(), ref.valueKind, ref.specifier, it.skipToChildIndex);
+                VariableReference variableReference(var, ref.frameId, it.trValue.Detach(), ref.valueKind, specifier, it.skipToChildIndex);
                 references.emplace(var.variablesReference, std::move(variableReference));
             }
         }
@@ -664,13 +665,13 @@ HRESULT GetChildren(const VariableReference &ref, ICorDebugThread *pThread, std:
             {
                 var.evaluateName = ref.evaluateName + (isIndex ? "" : ".") + var.name;
             }
-            IfFailRet(FillValueAndType(pThread, ref.specifier, it, var));
+            IfFailRet(FillValueAndType(pThread, specifier, it, var));
             if (!it.realDisplayTypeName.empty())
             {
                 var.type = std::move(it.realDisplayTypeName);
             }
             IfFailRet(GetMemoryReference(it.trValue, var.memoryReference));
-            IfFailRet(AddVariableReference(pThread, var, ref.frameId, it.trValue, ValueKind::Variable, ref.specifier, it.skipToChildIndex));
+            IfFailRet(AddVariableReference(pThread, var, ref.frameId, it.trValue, ValueKind::Variable, specifier, it.skipToChildIndex));
         }
 
         variables.push_back(var);
@@ -681,7 +682,7 @@ HRESULT GetChildren(const VariableReference &ref, ICorDebugThread *pThread, std:
         Variable var;
         var.name = "Static members";
         IfFailRet(MetadataHelpers::GetFQDisplayTypeName(ref.trValue, var.evaluateName)); // do not expose the type for this fake variable
-        IfFailRet(AddVariableReference(pThread, var, ref.frameId, ref.trValue, ValueKind::Static, ref.specifier, 0));
+        IfFailRet(AddVariableReference(pThread, var, ref.frameId, ref.trValue, ValueKind::Static, specifier, 0));
         variables.push_back(var);
     }
 
@@ -691,7 +692,8 @@ HRESULT GetChildren(const VariableReference &ref, ICorDebugThread *pThread, std:
 } // unnamed namespace
 
 // The caller must guarantee that pProcess is not null.
-HRESULT GetVariables(ICorDebugProcess *pProcess, uint32_t variablesReference, std::vector<Variable> &variables)
+HRESULT GetVariables(ICorDebugProcess *pProcess, uint32_t variablesReference, std::vector<Variable> &variables,
+                     FormatSpecifier format)
 {
     const std::scoped_lock<std::recursive_mutex> lock(GetReferencesMutex());
 
@@ -711,11 +713,11 @@ HRESULT GetVariables(ICorDebugProcess *pProcess, uint32_t variablesReference, st
 
     if (ref.IsScope())
     {
-        IfFailRet(GetStackVariables(ref.frameId, trThread, variables));
+        IfFailRet(GetStackVariables(ref.frameId, trThread, variables, format));
     }
     else
     {
-        IfFailRet(GetChildren(ref, trThread, variables));
+        IfFailRet(GetChildren(ref, trThread, variables, format));
     }
     return S_OK;
 }
@@ -774,7 +776,7 @@ HRESULT GetScopes(ICorDebugProcess *pProcess, FrameId frameId, std::vector<Scope
 }
 
 HRESULT Evaluate(ICorDebugProcess *pProcess, FrameId frameId, const std::string &expressionWithFormat,
-                 Variable &variable, std::string &output)
+                 Variable &variable, std::string &output, FormatSpecifier format)
 {
     const ThreadId threadId = frameId.GetThread();
     if (!threadId)
@@ -789,6 +791,7 @@ HRESULT Evaluate(ICorDebugProcess *pProcess, FrameId frameId, const std::string 
     FormatSpecifier specifier = FormatSpecifier::None;
     std::string expression;
     EvalFormatSpecifiers::ParseFormatSpecifier(expressionWithFormat, expression, specifier);
+    specifier = specifier | format;
 
     ToRelease<ICorDebugValue> trResultValue;
     const FrameLevel frameLevel = frameId.GetLevel();
