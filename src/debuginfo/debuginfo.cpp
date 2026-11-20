@@ -653,6 +653,12 @@ HRESULT GetStepRangeFromCurrentIP(ICorDebugThread *pThread, COR_DEBUG_STEP_RANGE
         return E_FAIL;
     }
 
+    return GetStepRangeFromFrame(trFrame, range);
+}
+
+HRESULT GetStepRangeFromFrame(ICorDebugFrame *trFrame, COR_DEBUG_STEP_RANGE &range)
+{
+    HRESULT Status = S_OK;
     mdMethodDef methodToken = mdMethodDefNil;
     IfFailRet(trFrame->GetFunctionToken(&methodToken));
 

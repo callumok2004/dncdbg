@@ -30,12 +30,21 @@ int &GetEnabledStepThreadId()
 
 } // unnamed namespace
 
-HRESULT SetupStep(ICorDebugThread *pThread, StepType stepType)
+HRESULT SetupStep(ICorDebugThread *pThread, StepType stepType, ICorDebugFrame *pFrame)
 {
     HRESULT Status = S_OK;
 
+    // A frame is given when the thread's active frame is native (for example, a P/Invoke blocked in GetMessage),
+    // the step is then relative to the first managed frame with source.
     ToRelease<ICorDebugStepper> trStepper;
-    IfFailRet(pThread->CreateStepper(&trStepper));
+    if (pFrame != nullptr)
+    {
+        IfFailRet(pFrame->CreateStepper(&trStepper));
+    }
+    else
+    {
+        IfFailRet(pThread->CreateStepper(&trStepper));
+    }
 
     constexpr auto mask = static_cast<CorDebugIntercept>(INTERCEPT_ALL & ~(INTERCEPT_SECURITY | INTERCEPT_CLASS_INIT)); // NOLINT(bugprone-signed-bitwise, clang-analyzer-optin.core.EnumCastOutOfRange)
     IfFailRet(trStepper->SetInterceptMask(mask));
@@ -66,7 +75,7 @@ HRESULT SetupStep(ICorDebugThread *pThread, StepType stepType)
     const BOOL bStepIn = (stepType == StepType::STEP_IN) ? TRUE : FALSE;
 
     COR_DEBUG_STEP_RANGE range;
-    if (SUCCEEDED(DebugInfo::GetStepRangeFromCurrentIP(pThread, range)))
+    if (SUCCEEDED(pFrame != nullptr ? DebugInfo::GetStepRangeFromFrame(pFrame, range) : DebugInfo::GetStepRangeFromCurrentIP(pThread, range)))
     {
         IfFailRet(trStepper->StepRange(bStepIn, &range, 1));
     }

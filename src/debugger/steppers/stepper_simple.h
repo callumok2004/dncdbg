@@ -17,7 +17,7 @@
 namespace dncdbg::SimpleStepper
 {
 
-HRESULT SetupStep(ICorDebugThread *pThread, StepType stepType);
+HRESULT SetupStep(ICorDebugThread *pThread, StepType stepType, ICorDebugFrame *pFrame = nullptr);
 
 // Important! Callbacks related methods must control return for succeeded return code.
 // Do not allow debugger API return succeeded (uncontrolled) return code.
